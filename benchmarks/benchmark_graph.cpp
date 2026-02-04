@@ -1,161 +1,225 @@
 #include "event_bus/event_bus.h"
+
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
-#include <fstream>
-#include <iomanip>
+#include <algorithm>
+#include <cstring>   // memcpy
 
 using namespace event_bus;
+using Clock = std::chrono::steady_clock;
 
-// -----------------------------
-// Configurations
-// -----------------------------
+// --------------------------------------------------
+// Config
+// --------------------------------------------------
 static constexpr size_t EVENTS_PER_PRODUCER = 500'000;
 static constexpr size_t QUEUE_CAPACITY = 1024;
+
 static const std::vector<size_t> PRODUCERS_LIST = {1, 2, 4, 8};
 static const std::vector<size_t> CONSUMERS_LIST = {1, 2, 4, 8};
 
-// -----------------------------
-// Mutex + queue
-// -----------------------------
+// --------------------------------------------------
+// Benchmark Event
+// --------------------------------------------------
+struct BenchEvent {
+    uint64_t id;
+};
+
+// --------------------------------------------------
+// MutexQueue
+// --------------------------------------------------
 class MutexQueue {
 public:
-    MutexQueue(size_t capacity) : capacity_(capacity) {}
+    explicit MutexQueue(size_t cap) : capacity_(cap) {}
 
-    bool push(const Event& ev) {
+    bool push(const BenchEvent& ev) {
         std::lock_guard<std::mutex> lock(mtx_);
         if (q_.size() >= capacity_) return false;
         q_.push(ev);
         return true;
     }
 
-    bool pop(Event& out) {
+    bool pop(BenchEvent& ev) {
         std::lock_guard<std::mutex> lock(mtx_);
         if (q_.empty()) return false;
-        out = q_.front();
+        ev = q_.front();
         q_.pop();
         return true;
     }
 
 private:
-    std::queue<Event> q_;
+    std::queue<BenchEvent> q_;
     std::mutex mtx_;
     size_t capacity_;
 };
 
-// -----------------------------
-// EventBus adapter
-// -----------------------------
+// --------------------------------------------------
+// EventBus Adapter (FIXED)
+// --------------------------------------------------
 struct EventBusAdapter {
-    EventBusAdapter(EventBus& bus) : bus_(bus) {}
-    bool push(const Event& ev) { return bus_.try_publish(ev); }
-    bool pop(Event& ev) { return bus_.try_consume(ev); }
+    explicit EventBusAdapter(EventBus& bus) : bus_(bus) {}
+
+    bool push(const BenchEvent& ev) {
+        Event e{};
+        e.type = 0;
+        std::memcpy(e.payload.data(), &ev.id, sizeof(ev.id));
+        return bus_.try_publish(e);
+    }
+
+    bool pop(BenchEvent& ev) {
+        Event e{};
+        if (!bus_.try_consume(e))
+            return false;
+
+        std::memcpy(&ev.id, e.payload.data(), sizeof(ev.id));
+        return true;
+    }
+
 private:
     EventBus& bus_;
 };
 
-// -----------------------------
-// Benchmark template
-// -----------------------------
-template<typename QueueType>
-uint64_t run_benchmark(QueueType& q, size_t producers, size_t consumers) {
-    std::atomic<uint64_t> produced{0};
-    std::atomic<uint64_t> consumed{0};
+// --------------------------------------------------
+// Benchmark Result
+// --------------------------------------------------
+struct Result {
+    uint64_t elapsed_us;
+    double avg_latency_us;
+    double p99_latency_us;
+};
+
+// --------------------------------------------------
+// Benchmark Core
+// --------------------------------------------------
+template <typename Queue>
+Result run_benchmark(Queue& q, size_t producers, size_t consumers) {
+    const size_t total_events = producers * EVENTS_PER_PRODUCER;
+
+    std::vector<Clock::time_point> timestamps(total_events);
+    std::vector<uint64_t> latencies;
+    latencies.reserve(total_events);
+
+    std::atomic<size_t> produced{0};
+    std::atomic<size_t> consumed{0};
     std::atomic<bool> start{false};
 
+    std::mutex latency_mtx;
+
     // Producers
-    std::vector<std::thread> producer_threads;
+    std::vector<std::thread> prod_threads;
     for (size_t p = 0; p < producers; ++p) {
-        producer_threads.emplace_back([&] {
+        prod_threads.emplace_back([&, p] {
             while (!start.load(std::memory_order_acquire))
                 std::this_thread::yield();
 
+            size_t base = p * EVENTS_PER_PRODUCER;
             for (size_t i = 0; i < EVENTS_PER_PRODUCER; ++i) {
-                Event ev{};
-                ev.type = static_cast<uint32_t>(p);
-                while (!q.push(ev)) std::this_thread::yield();
+                size_t id = base + i;
+                timestamps[id] = Clock::now();
+
+                BenchEvent ev{id};
+                while (!q.push(ev))
+                    std::this_thread::yield();
+
                 produced.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
 
     // Consumers
-    std::vector<std::thread> consumer_threads;
+    std::vector<std::thread> cons_threads;
     for (size_t c = 0; c < consumers; ++c) {
-        consumer_threads.emplace_back([&] {
-            Event ev{};
-            while (consumed.load(std::memory_order_relaxed) <
-                   producers * EVENTS_PER_PRODUCER) {
-                if (q.pop(ev))
+        cons_threads.emplace_back([&] {
+            BenchEvent ev{};
+            while (consumed.load(std::memory_order_relaxed) < total_events) {
+                if (q.pop(ev)) {
+                    auto now = Clock::now();
+                    auto latency =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            now - timestamps[ev.id]).count();
+
+                    {
+                        std::lock_guard<std::mutex> lock(latency_mtx);
+                        latencies.push_back(latency);
+                    }
+
                     consumed.fetch_add(1, std::memory_order_relaxed);
-                else
+                } else {
                     std::this_thread::yield();
+                }
             }
         });
     }
 
-    // Start test
-    auto t1 = std::chrono::steady_clock::now();
+    auto t1 = Clock::now();
     start.store(true, std::memory_order_release);
 
-    for (auto& t : producer_threads) t.join();
-    for (auto& t : consumer_threads) t.join();
-    auto t2 = std::chrono::steady_clock::now();
+    for (auto& t : prod_threads) t.join();
+    for (auto& t : cons_threads) t.join();
+    auto t2 = Clock::now();
 
-    auto elapsed_us =
+    uint64_t elapsed_us =
         std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-    return elapsed_us;
+
+    std::sort(latencies.begin(), latencies.end());
+
+    double avg = 0.0;
+    for (auto v : latencies) avg += v;
+    avg /= latencies.size();
+
+    size_t p99_index = static_cast<size_t>(latencies.size() * 0.99);
+    double p99 = latencies[p99_index];
+
+    return {elapsed_us, avg, p99};
 }
 
-// -----------------------------
-// CSV Output helper
-// -----------------------------
-void write_csv_header(std::ofstream& ofs) {
-    ofs << "Producers,Consumers,MutexQueue_us,EventBus_us,Speedup\n";
+// --------------------------------------------------
+// CSV Helpers
+// --------------------------------------------------
+void write_header(std::ofstream& out) {
+    out << "Producers,Consumers,"
+        << "Mutex_us,MutexAvgLatency_us,MutexP99Latency_us,"
+        << "Bus_us,BusAvgLatency_us,BusP99Latency_us\n";
 }
 
-void write_csv_row(std::ofstream& ofs, size_t producers, size_t consumers,
-                   uint64_t mutex_us, uint64_t bus_us) {
-    double speedup = static_cast<double>(mutex_us) / bus_us;
-    ofs << producers << "," << consumers << "," << mutex_us << "," << bus_us
-        << "," << std::fixed << std::setprecision(2) << speedup << "\n";
-}
-
-// -----------------------------
+// --------------------------------------------------
 // Main
-// -----------------------------
+// --------------------------------------------------
 int main() {
     std::ofstream csv("benchmark_results.csv");
-    write_csv_header(csv);
+    write_header(csv);
 
-    for (size_t p : PRODUCERS_LIST) {
-        for (size_t c : CONSUMERS_LIST) {
-            // MutexQueue
-            MutexQueue mutex_q(QUEUE_CAPACITY);
-            uint64_t mutex_time = run_benchmark(mutex_q, p, c);
+    for (auto p : PRODUCERS_LIST) {
+        for (auto c : CONSUMERS_LIST) {
 
-            // EventBus
+            MutexQueue mq(QUEUE_CAPACITY);
+            auto r_mutex = run_benchmark(mq, p, c);
+
             EventBus bus(QUEUE_CAPACITY);
-            EventBusAdapter bus_adapter(bus);
-            uint64_t bus_time = run_benchmark(bus_adapter, p, c);
+            EventBusAdapter adapter(bus);
+            auto r_bus = run_benchmark(adapter, p, c);
 
-            write_csv_row(csv, p, c, mutex_time, bus_time);
+            csv << p << "," << c << ","
+                << r_mutex.elapsed_us << ","
+                << r_mutex.avg_latency_us << ","
+                << r_mutex.p99_latency_us << ","
+                << r_bus.elapsed_us << ","
+                << r_bus.avg_latency_us << ","
+                << r_bus.p99_latency_us << "\n";
 
-            std::cout << "[Run] P=" << p << " C=" << c
-                      << " | MutexQueue=" << mutex_time / 1000.0 << " ms"
-                      << " | EventBus=" << bus_time / 1000.0 << " ms"
-                      << " | Speedup=" << std::fixed
-                      << std::setprecision(2)
-                      << static_cast<double>(mutex_time)/bus_time
-                      << "x\n";
+            std::cout
+                << "[P=" << p << " C=" << c << "] "
+                << "Mutex: " << r_mutex.elapsed_us / 1000.0 << " ms | "
+                << "Bus: " << r_bus.elapsed_us / 1000.0 << " ms\n";
         }
     }
 
-    csv.close();
-    std::cout << "\nBenchmark complete. Results saved to 'benchmark_results.csv'.\n";
+    std::cout << "\nBenchmark complete. CSV written.\n";
     return 0;
 }
